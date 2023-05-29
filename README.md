@@ -65,7 +65,7 @@ In brief:–
 
 ```bash
 $ ~/.local/sbin/remove_ads --help
-usage: /home/alexk/.local/sbin/remove_ads MP4NAME -ACTION
+usage: /home/user/.local/sbin/remove_ads MP4NAME -ACTION
 
 1. CUT-out sections from MP4 video, or
 2. JOIN the cutouts into a new video
@@ -155,8 +155,8 @@ you would trawl through the video to find 4 times:
 (the 4 items above are all intended to represent times in the accepted format)
 
 You would then call this script twice with the following values:–
-  1. /home/alexk/.local/sbin/remove_ads MP4NAME -c "BEGIN-VIDEO,BEGIN-AD"
-  2. /home/alexk/.local/sbin/remove_ads MP4NAME -c "END-AD,END-VIDEO"
+  1. /home/user/.local/sbin/remove_ads MP4NAME -c "BEGIN-VIDEO,BEGIN-AD"
+  2. /home/user/.local/sbin/remove_ads MP4NAME -c "END-AD,END-VIDEO"
 
 The script would save 2 mp4 files, called "cut-000.mp4" + "cut-001.mp4". It
 would also create a file called parts.txt, which would contain the following lines:
