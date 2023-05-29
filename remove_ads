@@ -1,0 +1,577 @@
+#!/bin/bash
+# remove_ads: Remove a set of Adverts from a mp4 movie
+#
+# 2023-05-29 corrected minor help() text errors
+# 2021-12-20 added mp3, m4a options
+
+set -eo pipefail
+shopt -s expand_aliases
+alias ffmpeg='ffmpeg -hide_banner'
+alias ffprobe='ffprobe -hide_banner'
+alias Reset="tput sgr0" # Reset text attributes to normal, not clearing screen
+
+CUT='cut';          # mp4 (part) basename for cutout sections
+DIR="";             # dir that MP4NAME sits in
+FN="";              # mp4 basename without '.mp4' extension
+KF="kf.txt";        # list of mp4 keyframes
+MP4="";             # mp4 basename
+NEEDLE=","          # separator for TIME
+PARTS='parts.txt';  # plain-text list of ad-free parts of mp4
+RE_C="^file \'$CUT-\d\d\d.mp4\'$"; # regex to confirm CUT-file format
+RE_T='^\d\d:\d\d:\d\d(\.\d{3})?$'; # regex to confirm TIME1, TIME2 format
+TEMP='tmp.txt';     # temporary file for use with -a ADD routine
+TIME=TIME1=TIME2='';# times when ACTION=cut
+TLS=""              # 3-letter suffix
+UPDATE="";          # mp4 with added noad = "$FN-noad.mp4"
+
+# list of internal functions:
+# CECHO()           # echo in magenta
+# HELP()            # HereDoc full help
+# HELP_BRIEF        # (actually a var): one-line help
+# HELP_SHORT()      # HereDoc short-ish help
+
+HELP_BRIEF="usage: $0 MP4NAME -ACTION";
+HELP_SHORT()
+{
+cat << EOF
+$HELP_BRIEF
+
+1. CUT-out sections from MP4 video, or
+2. JOIN the cutouts into a new video
+utilities:
+3. ADD keyFrames to a mp4
+4. LIST keyFrames from mp4 to disk
+
+    MP4NAME      : mp4-source filename
+ACTIONs:
+   -a ADD "time1,time2,…"
+      Time format: 'HH:MM:SS(.m)' [hours:minutes:seconds(.milli-secs)]
+            time1: keyFrame1
+            time2: keyFrame2
+   -c CUT "time1,time2"
+      Time format: 'HH:MM:SS(.m)' [hours:minutes:seconds(.milli-secs)]
+            time1: start of section
+            time2:   end of section
+   -h HELP       : Show Help
+  --help         : Show Full Help
+   -j JOIN       : Stitch all CUT-files together
+      Makes use of $PARTS (a plain-text list of files)
+   -k KEYFRAME   : (utility) List keyframes to disk-file
+
+Note: CUT + JOIN + HELP may also be used on mp3/m4a audio files
+      read 'mp4' as 'mp4 or mp3 or m4a' in HELP for those options
+
+WORKFLOW:
+# https://trac.ffmpeg.org/wiki/Concatenate#demuxer
+# http://trac.ffmpeg.org/wiki/Seeking
+In brief:–
+  a) Place the MP4-with-ads into an empty directory
+  b) Locate the Start-time + End-time of all Ad-breaks
+  c) -c CUT each ad-free section out to disk
+  d) Check that $PARTS contains all ad-free sections
+  e) -j JOIN all ad-free sections into a new mp4
+
+EOF
+} # HELP_SHORT
+
+HELP()
+{
+cat << EOF
+At dreadful length:–
+  1) Place the MP4-with-ads into an empty directory
+  -------------------------------------------------
+
+Your device will require free-space to at least 2 x the size of the original mp4
+
+  2) Locate the Start-time + End-time of all Ad-breaks
+  ----------------------------------------------------
+
+MPV video-player, launched from the terminal, can display times to the msec:
+eg
+See https://mpv.io/manual/master/:–
+\$ mpv --osd-fractions Captain-Blood-1935.mp4
+ (+) Video --vid=1 (*) (h264 720x576 24.999fps)
+ (+) Audio --aid=1 (*) (aac 2ch 48000Hz)
+AO: [pulse] 48000Hz stereo 2ch float
+VO: [gpu] 720x576 => 768x576 yuv420p
+(Paused) AV: 00:00:35.732 / 01:50:05.354 (0%) A-V:  0.003
+
+thus: time of paused frame == "00:00:35.732"
+
+Keyboard Control:–
+LEFT and RIGHT:
+  Seek backward/forward 5 seconds
+UP and DOWN:
+  Seek forward/backward 1 minute
+.:
+  Step forward & play one frame then pause (fast)
+,:
+  Step back & play one frame (slow)
+q and Q:
+  Stop playing and quit
+  (remember current & resume later if 'Q')
+
+  3) -c CUT each ad-free section out to disk
+  ------------------------------------------
+
+see https://ffmpeg.org/ffmpeg-utils.html#Time-duration
+This program accepts either of the 2 formats below
+(each in this instance would indicate zero seconds):–
+  '00:00:00'  or
+  '00:00:00.000'
+
+Thus, as a minimum example of a video with a single ad-break,
+you would trawl through the video to find 4 times:
+    i) BEGIN-VIDEO
+   ii) BEGIN-AD
+  iii) END-AD
+   iv) END-VIDEO
+
+(the 4 items above are all intended to represent times in the accepted format)
+
+You would then call this script twice with the following values:–
+  1. $0 MP4NAME -c "BEGIN-VIDEO,BEGIN-AD"
+  2. $0 MP4NAME -c "END-AD,END-VIDEO"
+
+The script would save 2 mp4 files, called "$CUT-000.mp4" + "$CUT-001.mp4". It
+would also create a file called $PARTS, which would contain the following lines:
+  file '$CUT-000.mp4'
+  file '$CUT-001.mp4'
+
+  4) Check that $PARTS contains all ad-free sections
+  -----------------------------------------------------
+
+The files referenced within $PARTS — and only those files — will be
+stitched together in the same order as they appear within $PARTS.
+
+  5) -j JOIN all ad-free sections into a new mp4
+  ----------------------------------------------
+
+The new ad-free mp4 is called the same as 'MP4NAME' with "noad" added to the end
+of the name. No intermediate files are deleted. Make sure that you empty the dir
+after moving 'MP4NAME-noad' to a safe place.
+
+Two utility functions are provided:
+
+  A) -k list all KEYFRAMEs from mp4 to $KF
+  --------------------------------------------
+
+Non-destructive, this does what it says on the tin. KeyFrame times are shown in
+the same hh:mm:ss.mss format as input times (see (3) above).
+
+  B) -a ADD a set of KeyFrames to a mp4
+  -------------------------------------
+
+This utility is used when you either want very short CUTs from a mp4, and/or if
+you cannot get an accurate CUT (either BEGIN or END) with an mp4, and perhaps a
+scene-change is leaking on to the beginning/end of a CUT.
+
+Try to use this only with short videos. Here is a decision matrix:
+     • “-c copy” can NOT be used (KF would not be added)
+     • typical add times are ~1:1 (ie ~1 hr for a 1hr mp4)
+     • typical default use is 1:250 for KF:f (every 10 secs at 25 fps)
+     • KF are *supposed* to be added by default at all scene-changes;
+       my experience is KF sometimes missing/misplaced at scene-changes
+     • force-adding a KF can change all other KF around it
+     • ffmpeg uses force-KF millisec times as advisory, not obligatory
+     • Thus, if you are having difficulty getting accurate -c CUT times:–
+       ◦ over-CUT a section out of the mp4
+       ◦ -a ADD a set of KF to the CUT-out section; include:–
+            → a 00:00:00.000 KF (first one)
+            → an END-time KF    (last one)
+            → then BEGIN-Time + END-Time KFs for each section wanted
+       ◦ it should now be possible to get accurate cuts on each KF
+
+general notes:
+     • “-c copy” means it takes seconds to process hours-long videos
+     • ( the speed is achieved by placing “-ss” *before* “-i”; ffmpeg then   )
+       ( seeks to the time using KFs; this all can mean very inaccurate cuts )
+     • “-c copy” also means that each CUT-file MUST have the same format
+       (in this case yes, as has been cut from the same source-file)
+     • Each new video begins at 00:00:00, as does the no-ad mp4
+     • No steps are taken for subtitles, chapters or any other streams
+       (global metadata tends to be copied across eg Title)
+     • This script has been tested only on MP4 videos
+
+EOF
+} # HELP()
+
+CECHO ()                 # echo in magenta
+{
+black='\E[30;47m'
+red='\E[31;47m'
+green='\E[32;47m'
+yellow='\E[33;47m'
+blue='\E[34;47m'
+magenta='\E[35;40m'      # magenta foreground, white background
+cyan='\E[36;47m'
+white='\E[37;47m'
+
+echo -en "$magenta"
+echo -n "${1}"           # no newline
+Reset
+
+return
+} # CECHO ()
+
+# show HELP if no input OR first param is "-h" OR "-H"
+if [ -z "$1" ]; then
+  CECHO "!Error!"; echo " No MP4NAME nor ACTION in command."
+  echo "$HELP_BRIEF"
+  exit 2
+else if [[ "$1" == "-h" || "$1" == "-H" ]]; then
+  HELP_SHORT
+  exit
+else if [[ "$1" == "--help" || "$1" == "--HELP" ]]; then
+  HELP_SHORT
+  HELP
+  exit
+else
+  MP4NAME="$1"
+  # 'shift' moves all positional parameters down by one
+  shift
+fi fi fi
+
+# there must be at least one parameter left
+if [ -z "$1" ]; then
+  CECHO "!Error!"; echo "'ACTION' parameter is missing"
+  HELP_SHORT
+  exit 2
+else
+  # set default parameter
+  ACTION=j
+fi
+
+# set $DIR + $FN + $TLS + $MP4, and check for file existence
+MP4="${MP4NAME##*/}";  # parameter expansion to basename; see https://tldp.org/LDP/abs/html/refcards.html#AEN22828
+TLS="${MP4##*.}";
+DIR="${MP4NAME%/*}";   # parameter expansion to directory
+RE_C="^file \'$CUT-\d\d\d.$TLS\'$"; # (update now $TLS is known) regex to confirm CUT-file format
+if [ "$MP4" = "$DIR" ]; then
+  # no path provided with mp4 filename
+  # try to provide it
+  DIR="$PWD"
+  if [ -z "$DIR" ]; then
+    CECHO "!Fatal Error!"; echo " The mp4 filename was provided without a directory-path, and \$PWD is empty";
+    echo -n "Please add the directory path to the mp4 filename and try again."
+    HELP_SHORT
+    exit 2
+  fi
+fi
+FN="${MP4%.*}";        # basename without TLS extension
+UPDATE="${FN}-noad.$TLS";
+if [ ! -f "$DIR/$MP4" ]; then
+  CECHO "!Error!"; echo " Problems finding the mp4 file; did you include it?";
+  echo -n "Cannot find ‘"; CECHO "$MP4"; echo -n "’ in ‘"; CECHO "$DIR"; echo "’."
+  HELP_SHORT
+  exit 2
+fi
+
+# which ACTION?
+#while [ $# -gt 0 ]; do # ’til we run out of parameters…
+  case "$1" in
+    a|A|-a|-A|--add|--ADD)           ACTION=a;;
+    c|C|-c|-C|--cut|--CUT)           ACTION=c;;
+    h|H|-h|-H)                       HELP_SHORT; exit 0;;
+    --help|--HELP)                   HELP_SHORT; HELP; exit 0;;
+    j|J|-j|-J|--join|--JOIN)         ACTION=j;;
+    k|K|-k|-K|--keyframe|--KEYFRAME) ACTION=k;;
+    *) CECHO "Unknown parameter/error while processing options"; echo; echo "$HELP_BRIEF"; exit 2;;
+  esac
+#shift       # check next parameter
+#done        # could be one more parameter to check
+
+# act on the $ACTION
+case "$ACTION" in
+  a)
+  # ADD
+  #---------------------------------------------------------
+  # Add KeyFrames to a MP4 video
+  #
+  # 'shift' moves all positional parameters down by one
+  shift
+  # there must be at least one parameter left
+  if [ -z "$1" ]; then
+    CECHO "!Fatal Error!"; echo "the CUT 'time1,time2,…' parameter is missing"
+    $HELP_SHORT
+    exit 2
+  else
+    TIME="$1"
+    if [ -z "$TIME" ]; then
+      CECHO "!Error! "; echo "TIME for the ADD parameter is empty."
+      echo "Cannot proceed. Exiting now."
+      exit 2
+    fi
+    # Clear to begin … after basic checks:–
+    echo "This ADD routine adds a set of KeyFrames to the mp4 file and saves it within the local dir. Note that ffmpeg + grep need to be pre-installed on your system.";
+    # 1. check for installation of ffmpeg
+    echo "1) Checking for installation of ffmpeg in the system …";
+    # ffmpeg shows banner here even with hide_banner
+    if ffmpeg -version | head -n 1; then
+      echo "ffmpeg is installed";
+    else
+      CECHO "!Fatal Error!"; echo " ffmpeg is NOT installed. Exiting now.";
+      exit 2
+    fi
+    # 2. check for installation of grep
+    echo "2) Checking for installation of grep in the system …";
+    if grep --version | head -n 1; then
+      echo "grep is installed";
+    else
+      CECHO "!Fatal Error!"; echo " grep is NOT installed. Exiting now.";
+      exit 2
+    fi
+  fi
+  # Clear to begin:–
+  # check format of last parameter, TIME
+  # check for previous TEMP-file
+  if [ -f "$DIR/$TEMP" ]; then
+    # just remove it - the clue is in the name
+    if ! rm "$DIR/$TEMP"; then
+      CECHO "!Error! "; echo "Cannot remove the previous "$DIR/$TEMP" file."
+      echo "Please remove that file. Exiting now."
+      exit 2
+    fi
+  fi
+  IFS=','; read -ra ADDR <<< "$TIME"; for i in "${ADDR[@]}"; do echo "$i" >> "$DIR/$TEMP"; done;
+  # paranoia checks
+  TIME1=$(cat tmp.txt | wc -l);  # re-purposing these parameters
+  TIME2=$(grep -cP "$RE_T" "$DIR/$TEMP")
+  if [ "$TIME1" -gt "$TIME2" ]; then
+    CECHO "!Fatal Error! "; echo "The number of supplied times ($TIME1) within the TIME parameter is larger than the number of correctly-formatted times ($TIME2)."
+    echo "This is the TIME parameter supplied:–"
+    echo "$TIME"
+    echo ""
+    echo "These are the Times that show a format error:–"
+    for i in "${ADDR[@]}"; do
+      if [ "`echo $i | grep -cP "$RE_T"`" -lt 1 ]; then
+        echo "‘$i’ shows a format error.";
+      fi
+    done;
+    $HELP_SHORT
+    exit 2
+  fi
+  if [ "$TIME2" -gt "$TIME1" ]; then
+    CECHO "!Undefined Fatal Error! "; echo "The number of correctly-formatted times ($TIME2) is larger than the number of supplied times ($TIME1)."
+    echo "This is the TIME parameter supplied:–"
+    echo "$TIME"
+    echo ""
+    echo "Exiting now."
+    exit 2
+  fi
+  # remove TEMP-file
+  if ! rm "$DIR/$TEMP"; then
+    CECHO "!Error! "; echo "Cannot remove the "$DIR/$TEMP" file."
+    echo "Please remove that file. Exiting now."
+    exit 2
+  fi
+  # 3. check that UPDATE does not already exist
+  UPDATE="${FN}-kf.mp4";
+  if [ -f "$DIR/$UPDATE" ]; then
+    CECHO "!Fatal Error! "; echo -n "An old copy of the UPDATE file “"; CECHO "$UPDATE"; echo -n "” already exists in “"; CECHO "$DIR"; echo "”."
+    echo "Please rename/move/remove that file. Exiting now."
+    exit 2
+  fi
+  # 4. now add KeyFrames to the mp4
+  echo -n "◦ Adding KeyFrames to “"; CECHO "$MP4"; echo "”."
+  # belt 'n' braces:
+  # faststart puts the moov atom at file-start (essential if streamed):
+  # see http://ffmpeg.org/ffmpeg.html#Advanced-Video-options
+  ffmpeg -i "$DIR/$MP4" -force_key_frames "$TIME" -movflags faststart "$DIR/$UPDATE"
+  echo -n "◦ The updated mp4 is called “"; CECHO "$UPDATE"; echo "”, whilst the original is unchanged."
+  exit 0;
+  ;;
+  c)
+  # CUT
+  #---------------------------------------------------------
+  # Cut-out Adverts from a MP4 video / MP3 / M4A audio
+  #
+  # The adverts are removed by:–
+  #  i) saving the parts *between* the ads
+  # ii) stitching those saved parts together again
+  #
+  # Doing it this way means that this script can also be
+  # used just to accurately extract small sections of a mp4/mp3/m4a
+  #
+  # 2021-11-25 added “-map_chapters -1” due to ALL chapter MD being transferred
+  #            & cut file (10 secs) thus showing full-length (2 hrs)
+  # 
+  # 'shift' moves all positional parameters down by one
+  shift
+  # there must be at least one parameter left
+  if [ -z "$1" ]; then
+    CECHO "!Fatal Error!"; echo "the CUT 'time1,time2' parameter is missing"
+    $HELP_SHORT
+    exit 2
+  else
+    # Clear to begin … after basic checks:–
+    echo "This CUT routine cuts out a segment from “$MP4” and saves it within the local dir. Note that ffmpeg + grep need to be pre-installed on your system.";
+   # 1. check for installation of ffmpeg
+   echo "1) Checking for installation of ffmpeg in the system …";
+   # ffmpeg shows banner here even with hide_banner
+   if ffmpeg -version | head -n 1; then
+     echo "ffmpeg is installed";
+   else
+     CECHO "!Fatal Error!"; echo " ffmpeg is NOT installed. Exiting now.";
+     exit 2
+   fi
+    # 2. check for installation of grep
+    echo "2) Checking for installation of grep in the system …";
+    if grep --version | head -n 1; then
+      echo "grep is installed";
+    else
+      CECHO "!Fatal Error!"; echo " grep is NOT installed. Exiting now.";
+      exit 2
+    fi
+    # check last parameter
+    TIME="$1"
+    TIME1=$(echo $TIME | cut -d"${NEEDLE}" -f 1)
+    TIME2=$(echo $TIME | cut -d"${NEEDLE}" -f 2)
+    if [ "`echo $TIME1 | grep -cP "$RE_T"`" -lt 1 ] || [ "`echo $TIME2 | grep -cP "$RE_T"`" -lt 1 ]
+    then
+      CECHO "!Error!"; echo " the format for the supplied CUT 'time1,time2' parameter is wrong"
+      echo -n "It should be: '"; CECHO "00:00:00(.000),00:00:00(.000)"; echo "'";
+      echo "Note 1: Each 0 (zero) above MUST be a digit 0-9; 2 for each hours:mins:secs"
+      echo "Note 2: The 3 digits in brackets (millisecs) are optional; do NOT include the brackets"
+      echo "Note 3: The separator for the hours:mins:secs MUST be a colon (:)"
+      echo "Note 4: The separator for 'time1,time2' MUST be a comma (,)"
+      echo "Note 5: Enclose the whole time parameter in quotes, but no spaces inside, only outside"
+      echo "$HELP_BRIEF"
+      exit 2
+    fi
+  fi
+  # Clear to begin:–
+  # Check for previous CUT-files + PARTS-file
+  # a) Check for previous CUT-files
+  # Test until no file collision
+  # (last value of nextCut is the next CUT to create):–
+  number=0
+  printf -v nextCut "%s-%03d.$TLS" "$CUT" "$number"
+  while [ -e "$DIR/$nextCut" ]; do
+    printf -v nextCut "%s-%03d.$TLS" "$CUT" "$(( ++number ))"
+  done
+  echo "\$nextCut=‘$nextCut’"
+  # b) Check for previous PARTS-file
+  if [ ! -f "$DIR/$PARTS" ]; then
+    touch "$DIR/$PARTS"
+  fi
+  # Clear to proceed:–
+  # Create the cut-file + add to PARTS-file
+  if ffmpeg -ss $TIME1 -to $TIME2 -i "$DIR/$MP4" -vsync 1 -avoid_negative_ts 'make_zero' -map_chapters -1 -c copy "$DIR/$nextCut"; then
+    echo "file '$nextCut'" >> "$DIR/$PARTS"
+    echo "File '$nextCut' has been extracted from $MP4 and a reference to it placed in '$DIR/$PARTS'."
+    echo "When the last section has been cutout you can then use JOIN to stitch together an ad-free file."
+  else
+    CECHO "!Fatal Error! "; echo "Failed whilst extracting ‘$nextCut’ from ‘$MP4’. Exiting now.";
+    exit 2
+  fi
+  ;;
+  j)
+  # JOIN
+  #---------------------------------------------------------
+  # Stitch together again parts of a mp4 / mp3 / m4a without the ads
+  # see also https://ffmpeg.org/ffmpeg-formats.html#concat-1
+  #
+  echo "This JOIN routine stitches together the ad-free parts of a mp4/mp3/m4a file previously cut-out into the local dir. Note that ffmpeg + grep needs to be pre-installed on your system.";
+  # 1. check for installation of ffmpeg
+  echo "1) Checking for installation of ffmpeg in the system …";
+  # ffmpeg shows banner here even with hide_banner
+  if ffmpeg -version | head -n 1; then
+    echo "ffmpeg is installed";
+  else
+    CECHO "!Fatal Error!"; echo " ffmpeg is NOT installed. Exiting now.";
+    exit 2
+  fi
+  # 2. check for installation of grep
+  echo "2) Checking for installation of grep in the system …";
+  if grep --version | head -n 1; then
+    echo "grep is installed";
+  else
+    CECHO "!Fatal Error!"; echo " grep is NOT installed. Exiting now.";
+    exit 2
+  fi
+  # Clear to begin:–
+  # Check for previous PARTS-file + CUT-files referenced within that file
+  # a) Check for previous PARTS-file
+  if [ ! -f "$DIR/$PARTS" ]; then
+    CECHO "!Fatal Error!"; echo " The file ‘$PARTS’ does not exist within ‘$DIR’.";
+    echo "That file is a list of the names of all cutout mp4/mp3/m4a files to join to make your ad-free mp4/mp3/m4a. Exiting now."
+    exit 2
+  fi
+  # a) Make sure PARTS-file is NOT empty
+  if [ ! -s "$DIR/$PARTS" ]; then
+    CECHO "!Fatal Error!"; echo " The file ‘$PARTS’ exists within ‘$DIR’ but is empty.";
+    echo "That file is a list of the names of all cutout mp4/mp3/m4a files to join to make your ad-free mp4/mp3.m4a. Exiting now."
+    exit 2
+  fi
+  # b) Make sure PARTS-file has at least 2 entries
+  if [ "`cat "$DIR/$PARTS" | wc -l`" -lt 1 ]; then
+    CECHO "!Fatal Error!"; echo " Only one entry within ‘$PARTS’ in ‘$DIR’; it takes at least two to party, baby.";
+    echo "The file ‘$PARTS’ is a list of the names of all cutout mp4/mp3.m4a files to join to make your ad-free mp4/mp3/m4a. Exiting now."
+    exit 2
+  fi
+  # c) Check that each CUT within PARTS exists in DIR
+  while read -r file; do
+    # check for match to CUT-name format (paranoia check) + file exists in DIR
+    if [ "`echo "$file" | grep -cP "$RE_C"`" -lt 1 ] || [ -f "$DIR/$file" ]; then
+      CECHO "!Fatal Error! "; echo "The file ‘$PARTS’ exists within ‘$DIR’, but the filename ‘$file’ within it either does not, or it’s name does NOT follow the cut-file format.";
+      echo "The file ‘$PARTS’ is a list of the names of all cutout mp4/mp3/m4a files to join to make your ad-free mp4/mp3/m4a. Exiting now"
+      exit 2
+    fi
+  done < "$DIR/$PARTS"
+  # Clear to proceed:–
+  # faststart puts the moov atom at file-start (essential if streamed):
+  if ! ffmpeg -f concat -i "$DIR/$PARTS" -vsync 1 -avoid_negative_ts 'make_zero' -movflags faststart -c copy "$DIR/$UPDATE"; then
+    CECHO "!Fatal Error! "; echo "Failed whilst stitching together a new file ‘$UPDATE’ from sections cut from ‘$MP4’ as located in ‘$PARTS’ within ‘$DIR’. Exiting now.";
+    exit 2
+  else
+    echo -n "Success! The new file ‘"; CECHO "$UPDATE"; echo -n "’ has been stitched together within ‘"; CECHO "$DIR"; echo "’. The original file ‘$MP4’ is left unchanged. The parts-file ‘$PARTS’ + cut-files ‘$CUT-???.$TLS’ are left for you to remove. Exiting now.";
+  fi
+  ;;
+  k)
+  # KEYFRAME (utility)
+  #---------------------------------------------------------
+  # List all KeyFrames in the mp4 to disk
+  #
+  # The keyframes are listed by:–
+  #   i) using ffprobe with special parameters
+  #  ii) passing through awk once to isolate each keyframe
+  # iii) passing through awk once more to turn secs into hh:mm:ss:ms
+  #
+  # This was written to confirm that, yes, -force_key_frames *does* work
+  # but only if we spend hours re-processing every wretched frame
+  # 
+  echo "This KEYFRAME routine is a utility to write-out to disk every keyframe within the supplied mp4. It is non-destructive. It requires that ffprobe + awk are pre-installed on your system.";
+  # 1. check for installation of ffprobe
+  echo "1) Checking for installation of ffprobe in the system …";
+  # ffprobe shows banner here even with hide_banner
+  if ffprobe -version | head -n 1; then
+    echo "ffprobe is installed";
+  else
+    CECHO "!Fatal Error! "; echo "ffprobe is NOT installed. Exiting now.";
+    exit 2
+  fi
+  # 2. check for installation of awk
+  echo "2) Checking for installation of awk in the system …";
+  if awk --version | head -n 1; then
+    echo "awk is installed";
+  else
+    CECHO "!Fatal Error! "; echo "awk is NOT installed. Exiting now.";
+    exit 2
+  fi
+  # 3. check for previous KF-file
+  if [ -f "$DIR/$KF" ]; then
+    CECHO "!Fatal Error! "; echo "The file ‘$KF’ already exists within ‘$DIR’.";
+    echo "That file is a text-list of the location of each KF within a mp4."
+    echo "Please move/rename/delete the existing file & try again. Exiting now."
+    exit 2
+  fi
+  # Clear to proceed:–
+  echo "About to list the location of every KEYFRAME within ‘$MP4’ in ‘$DIR/$KF’."
+  echo "Please be patient … this can take some time."
+  ffprobe -loglevel error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=print_section=0 "$DIR/$MP4" | \
+  awk -F',' '/K/ {print $1}' | \
+  awk '{printf("%02d:%02d:%02d.%03d\n",($1/60/60%24),($1/60%60),($1%60),($1*1000%1000))}' > "$DIR/$KF"
+  ;;
+esac
+exit 0
